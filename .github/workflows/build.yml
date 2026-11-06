@@ -1,0 +1,139 @@
+name: Build Ryzix 2048 Watch APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.24.5
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Generate Android platform scaffold
+        run: |
+          set -e
+          # org + project-name => applicationId / namespace com.ryzix2048.watch
+          flutter create --platforms=android --org com.ryzix2048 --project-name watch /tmp/scaffold
+          rm -rf android
+          cp -r /tmp/scaffold/android ./android
+          grep -rn 'com.ryzix2048' android/app/build.gradle* || true
+
+      - name: Watch manifest + verify package id
+        run: |
+          set -e
+          # label "2048", optional type.watch feature, Wear OS standalone flag,
+          # and a hard check that applicationId/namespace == com.ryzix2048.watch
+          python3 .github/patch_manifest.py
+
+      - name: Configure permanent release signing
+        run: |
+          set -e
+          # Keystore is committed at signing/signing-key.jks -> every build is
+          # signed with the SAME key. No random keystore is ever generated.
+          test -f signing/signing-key.jks
+          sha256sum signing/signing-key.jks
+          printf 'storeFile=%s\nstorePassword=ryzix2048\nkeyAlias=ryzix\nkeyPassword=ryzix2048\n' "$GITHUB_WORKSPACE/signing/signing-key.jks" > android/key.properties
+          cat android/key.properties
+          ls android/app
+          python3 .github/patch_signing.py
+
+      - name: Set version from run number
+        run: |
+          sed -i "s/^version: .*/version: 1.0.${{ github.run_number }}+${{ github.run_number }}/" pubspec.yaml
+          grep '^version' pubspec.yaml
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Sign release APK with the permanent keystore
+        id: apk
+        run: |
+          set -e
+          mkdir -p out
+          NAME="Ryzix2048-Watch-v1.0.${{ github.run_number }}.apk"
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          IN=build/app/outputs/flutter-apk/app-release.apk
+          cp "$IN" out/unsigned.apk
+          # Drop whatever signature Gradle applied (debug fallback included) so
+          # the ONLY signature on the shipped APK comes from signing-key.jks.
+          zip -q -d out/unsigned.apk 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.DSA' || true
+          "$BT/zipalign" -f -p 4 out/unsigned.apk out/aligned.apk
+          "$BT/apksigner" sign \
+            --ks signing/signing-key.jks \
+            --ks-pass pass:ryzix2048 \
+            --ks-key-alias ryzix \
+            --key-pass pass:ryzix2048 \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out "out/$NAME" out/aligned.apk
+          rm -f out/unsigned.apk out/aligned.apk out/*.idsig
+          ls -lh out
+
+      - name: Verify the signing certificate is stable
+        run: |
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --print-certs "out/${{ steps.apk.outputs.name }}" | tee certs.txt
+          APK_FP=$(grep -i -m1 'SHA-256 digest' certs.txt | awk '{print toupper($NF)}')
+          KS_FP=$(keytool -list -v -keystore signing/signing-key.jks -storepass ryzix2048 -alias ryzix \
+                  | grep -i 'SHA256:' | head -1 | awk '{print $2}' | tr -d ':' | tr 'A-F' 'A-F' | tr '[:upper:]' '[:upper:]')
+          echo "apk cert : $APK_FP"
+          echo "keystore : $KS_FP"
+          if grep -qi 'Android Debug' certs.txt; then
+            echo "FATAL: APK is debug-signed, updates would break."; exit 1
+          fi
+          if [ "$APK_FP" != "$KS_FP" ]; then
+            echo "FATAL: APK certificate does not match the permanent keystore."; exit 1
+          fi
+          echo "Signing certificate is the permanent one - updates will install over previous versions."
+
+      - name: Upload artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ryzix2048-watch-apk
+          path: out/*.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Ryzix 2048 Watch v1.0.${{ github.run_number }}
+          body: |
+            Ryzix 2048 Watch (com.ryzix2048.watch) - offline Flutter smartwatch build.
+            Signed with the permanent keystore committed at `signing/signing-key.jks`.
+          files: out/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
